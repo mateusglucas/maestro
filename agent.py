@@ -9,13 +9,92 @@
 # sem estados permanentes, sql..., tudo efêmero. Agent morre, workers morrem.
 # ID do agente deve ter parcela que indique maquina (hostname?) e parcela UUID like, pro server poder identificar maquina e se o agent é novo ou não.
 
-from abc import ABC, abstractmethod
 import tomllib
+from multiprocessing import Process, Queue
+import uuid
+from abc import ABC, abstractmethod
+
+from enum import StrEnum, auto
+
+class Event(StrEnum):
+    START_JOB = auto()
+    DONE_JOB = auto()
+    FAILED_JOB = auto()
+    SHUTDOWN_WORKER = auto()
 
 class Agent(ABC):
-    def __init__(self):
+    def __init__(self, work_fn):
         self._init_config()
+
+        self.work_fn = work_fn
+        self.jobs_queue = Queue()
+        self.events_queue = Queue()
+
+        self.workers = {}
+        
+        self._spawn_workers()
+
+    @abstractmethod
+    def _validate_job(self, job_id, payload):
+        pass
+
+    @abstractmethod
+    def _submit_result(self, job_id, payload):
+        pass
+
+    def run(self):
+        # TODO
+        pass
 
     def _init_config(self):
         with open("agent_config.toml", "rb") as f:
             self.config = tomllib.load(f)
+
+    def _spawn_workers(self):
+        for _ in range(self.config['jobs']['n_workers']):
+            worker_id = str(uuid.uuid4())
+
+            process = Process(
+                target = type(self)._worker_main,
+                args = (worker_id, self.work_fn, self.jobs_queue, self.events_queue),
+            )
+            process.start()
+
+            self.workers[worker_id] = process
+
+    @staticmethod
+    def _worker_main(worker_id, work_fn, jobs_queue, events_queue):
+        while True:
+            job = jobs_queue.get()
+
+            if job is None:
+                events_queue.put({
+                    'worker_id': worker_id,
+                    'type': Event.SHUTDOWN_WORKER,
+                })
+
+                return
+            
+            events_queue.put({
+                'worker_id': worker_id,
+                'type': Event.START_JOB,
+                'job_id': job['job_id'],
+            })
+
+            try:
+                result = work_fn(job['payload'])
+
+                events_queue.put({
+                    'worker_id': worker_id,
+                    'type': Event.DONE_JOB,
+                    'job_id': job['job_id'],
+                    'result': result,
+                })
+
+            except Exception as e:
+                events_queue.put({
+                    'worker_id': worker_id,
+                    'type': Event.FAILED_JOB,
+                    'job_id': job['job_id'],
+                    'error': str(e),
+                })
