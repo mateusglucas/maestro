@@ -1,0 +1,1 @@
+# recebe job do agent, se job None, termina processo. se não, roda e envia resultado pro agent quando finalizado e fica esperando novo job

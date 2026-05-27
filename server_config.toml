@@ -1,0 +1,5 @@
+[database]
+url = "sqlite:///test.db"
+
+[heartbeat]
+timeout = 300
