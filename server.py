@@ -12,8 +12,9 @@ from typing import Any
 import uuid
 from abc import ABC
 from abc import abstractmethod
+from contextlib import asynccontextmanager
 
-class JobStatus(str, StrEnum):
+class JobStatus(StrEnum):
     PENDING = auto()
     RUNNING = auto()
     DONE = auto()
@@ -45,20 +46,20 @@ class Agent(Base):
 class Api(ABC):
     def __init__(self):
         self._init_config()
-        self._init_db()
 
     def _init_config(self):
         with open("server_config.toml", "rb") as f:
             self.config = tomllib.load(f)
 
-    def _init_db(self):
+    async def init_database(self):
         database_url = self.config["database"]["url"]
 
         self.db_engine = create_async_engine(database_url)
 
         self.db_sessionmaker = async_sessionmaker(bind=self.db_engine, expire_on_commit=False)
 
-        Base.metadata.create_all(self.db_engine)
+        async with self.db_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
     async def register_agent(self, hostname):
         async with self.db_sessionmaker.begin() as session:
@@ -184,8 +185,15 @@ class Api(ABC):
             session.add(job)
 
 def create_app(api: Api):
-    app = FastAPI()
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await api.init_database()
+
+        yield
+
+
+    app = FastAPI(lifespan=lifespan)
 
 
     class RegisterAgentRequest(BaseModel):
@@ -227,3 +235,12 @@ def create_app(api: Api):
         return await api.add_job(req.payload)
 
     return app
+
+class TestApi(Api):
+    async def _submit_result(self, agent_id, job_id, payload):
+        pass
+
+    async def _validate_job(self, job_id, payload):
+        pass
+
+app = create_app(TestApi())
