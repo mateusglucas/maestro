@@ -1,7 +1,9 @@
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 from sqlalchemy import create_engine, event, String, JSON, DateTime, ForeignKey
+from sqlalchemy import select, update, insert, delete
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 import tomllib
 from enum import StrEnum, auto
@@ -52,134 +54,134 @@ class Api(ABC):
     def _init_db(self):
         database_url = self.config["database"]["url"]
 
-        self.db_engine = create_engine(
-            database_url,
-            connect_args={
-                "check_same_thread": False,
-                "timeout": 30,
-            }
-        )
+        self.db_engine = create_async_engine(database_url)
 
-        @event.listens_for(self.db_engine, "connect")
-        def do_connect(dbapi_connection, connection_record):
-            # Desativa o gerenciamento implícito do driver nativo do Python
-            dbapi_connection.isolation_level = None
-
-        @event.listens_for(self.db_engine, "begin")
-        def do_begin(conn):
-            # Emite manualmente o comando IMMEDIATE na raiz da transação
-            conn.exec_driver_sql("BEGIN IMMEDIATE")
-
-        self.db_sessionmaker = sessionmaker(bind=self.db_engine)
+        self.db_sessionmaker = async_sessionmaker(bind=self.db_engine, expire_on_commit=False)
 
         Base.metadata.create_all(self.db_engine)
 
-    def register_agent(self, hostname):
-        with self.db_sessionmaker.begin() as session:
+    async def register_agent(self, hostname):
+        async with self.db_sessionmaker.begin() as session:
             now = datetime.now()
-            id = str(uuid.uuid4())
+            agent_id = str(uuid.uuid4())
             
             agent = Agent()
 
-            agent.id = id
+            agent.id = agent_id
             agent.hostname = hostname
             agent.first_seen = now
             agent.last_seen = now
 
             session.add(agent)
 
-            return {'agent_id': id}
+            return {'agent_id': agent_id}
 
-    def heartbeat(self, agent_id):
-        with self.db_sessionmaker.begin() as session:           
-            agent = (
-                session.query(Agent)
-                .filter(Agent.id == agent_id)
-                .first()
-            )
+    async def heartbeat(self, agent_id):
+        async with self.db_sessionmaker.begin() as session:  
+            stmt = (
+                update(Agent)
+                .where(Agent.id == agent_id)
+                .values(last_seen=datetime.now())
+                .returning(Agent)
+            )     
+
+            agent = (await session.execute(stmt)).scalar_one_or_none()
 
             if agent is None:
                 raise HTTPException(status_code=404, detail="Unknown agent")
 
-            agent.last_seen = datetime.now()
-
-    def submit_result(self, agent_id, job_id, payload):
-        with self.db_sessionmaker.begin() as session:
-            job = (
-                session.query(Job)
-                .filter(Job.id == job_id)
-                .first()
+    async def submit_result(self, agent_id, job_id, payload):
+        async with self.db_sessionmaker.begin() as session:
+            stmt = (
+                update(Job)
+                .where(Job.id == job_id,
+                       Job.assigned_agent_id == agent_id,
+                       Job.status == JobStatus.RUNNING)
+                .values(finished_at = datetime.now(),
+                        status = JobStatus.Done)
+                .returning(Job)
             )
+
+            job = (await session.execute(stmt)).scalar_one_or_none()
 
             if job is None:
-                raise HTTPException(status_code=404, detail="Job not found")
+                raise HTTPException(status_code=404, detail="Invalid operation")
 
-            if job.assigned_agent_id != agent_id:
-                raise HTTPException(status_code=409, detail="Job not assigned to agent")
-
-            if job.status != JobStatus.RUNNING:
-                raise HTTPException(status_code=409, detail=f"Job status is not RUNNING ({job.status})")
-
-            job.finished_at = datetime.now()
-            job.status = JobStatus.DONE
-
-            self._submit_result(agent_id, job_id, payload)
+            await self._submit_result(agent_id, job_id, payload)
         
     @abstractmethod
-    def _submit_result(self, agent_id, job_id, payload):
+    async def _submit_result(self, agent_id, job_id, payload):
         pass
 
-    def request_job(self, agent_id):
+    async def request_job(self, agent_id):
         now = datetime.now()
 
-        with self.db_sessionmaker.begin() as session:
-            job = (
-                session.query(Job)
-                .filter(Job.status == JobStatus.PENDING)
-                .first()
+        async with self.db_sessionmaker.begin() as session:
+            candidate = (
+                select(Job.id)
+                .where(Job.status == JobStatus.PENDING)
+                .order_by(Job.created_at)
+                .limit(1)
+                .scalar_subquery()
             )
+
+            stmt = (
+                update(Job)
+                .where(Job.id == candidate)
+                .values(assigned_agent_id = agent_id,
+                        started_at = now,
+                        status = JobStatus.RUNNING)
+                .returning(Job)
+            )
+
+            job = (await session.execute(stmt)).scalar_one_or_none()
 
             if job is None:
                 # search for any stalled job
                 timeout = self.config['heartbeat']['timeout']
                 cutoff = now - timedelta(seconds=timeout)
 
-                job = (
-                    session.query(Job)
+                candidate = (
+                    select(Job.id)
                     .join(Agent)
-                    .filter(Job.status == JobStatus.RUNNING,
-                            Agent.last_seen < cutoff)
-                    .first()
+                    .where(Job.status == JobStatus.RUNNING,
+                           Agent.last_seen < cutoff)
+                    .order_by(Job.created_at)
+                    .limit(1)
+                    .scalar_subquery()
                 )
+
+                stmt = (
+                    update(Job)
+                    .where(Job.id == candidate)
+                    .values(assigned_agent_id = agent_id,
+                            started_at = now)
+                    .returning(Job)
+                )
+
+                job = (await session.execute(stmt)).scalar_one_or_none()
 
                 if job is None:
                     return
 
-            job.assigned_agent_id = agent_id
-            job.started_at = now
-            job.status = JobStatus.RUNNING
-
             return {'job_id': job.id, 'payload': job.payload}
 
     @abstractmethod
-    def _validate_job(self, job_id, payload):
+    async def _validate_job(self, job_id, payload):
         pass
 
-    def add_job(self, job_id, payload):
-        self._validate_job(job_id, payload)
+    async def add_job(self, payload):
+        await self._validate_job( payload)
 
-        try:
-            with self.db_sessionmaker.begin() as session:
-                job = Job()
+        async with self.db_sessionmaker.begin() as session:
+            job = Job()
 
-                job.id = job_id
-                job.payload = payload
-                job.status = JobStatus.PENDING
-                job.created_at = datetime.now()
+            job.id = str(uuid.uuid4())
+            job.payload = payload
+            job.status = JobStatus.PENDING
+            job.created_at = datetime.now()
 
-                session.add(job)
-        except IntegrityError:
-            raise HTTPException(status_code=409, detail= "Job already exists")
+            session.add(job)
 
 def create_app(api: Api):
     app = FastAPI()
@@ -190,39 +192,38 @@ def create_app(api: Api):
         hostname: str
 
     @app.post("/register_agent")
-    def register_agent(req: RegisterAgentRequest):
-        return api.register_agent(req.hostname)
+    async def register_agent(req: RegisterAgentRequest):
+        return await api.register_agent(req.hostname)
 
 
 
     @app.post("/heartbeat/{agent_id}")
-    def heartbeat(agent_id: str):
-        return api.heartbeat(agent_id)
+    async def heartbeat(agent_id: str):
+        return await api.heartbeat(agent_id)
 
 
 
     @app.post("/request_job/{agent_id}")
-    def request_job(agent_id: str):
-        api.heartbeat(agent_id)
+    async def request_job(agent_id: str):
+        await api.heartbeat(agent_id)
 
-        return api.request_job(agent_id)
+        return await api.request_job(agent_id)
 
 
 
     @app.post("/submit_result/{agent_id}/{job_id}")
-    def submit_result(agent_id: str, job_id: str, payload: bytes = Body(media_type="application/octet-stream")):
-        api.heartbeat(agent_id)
+    async def submit_result(agent_id: str, job_id: str, payload: bytes = Body(media_type="application/octet-stream")):
+        await api.heartbeat(agent_id)
 
-        return api.submit_result(agent_id, job_id, payload)
+        return await api.submit_result(agent_id, job_id, payload)
 
 
 
     class AddJobRequest(BaseModel):
-        job_id: str
         payload: dict[str, Any]
 
     @app.post("/add_job")
-    def add_job(req: AddJobRequest):
-        return api.add_job(req.job_id, req.payload)
+    async def add_job(req: AddJobRequest):
+        return await api.add_job(req.payload)
 
     return app

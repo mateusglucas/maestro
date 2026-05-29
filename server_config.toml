@@ -1,5 +1,5 @@
 [database]
-url = "sqlite:///test.db"
+url = "sqlite+aiosqlite:///test.db"
 
 [heartbeat]
 timeout = 300
