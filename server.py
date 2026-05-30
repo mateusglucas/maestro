@@ -1,12 +1,11 @@
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
-from sqlalchemy import create_engine, event, String, JSON, DateTime, ForeignKey
-from sqlalchemy import select, update, insert, delete
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import String, JSON, DateTime, ForeignKey, Enum
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 import tomllib
-from enum import StrEnum, auto
+import enum
 from datetime import datetime, timedelta
 from typing import Any
 import uuid
@@ -14,12 +13,12 @@ from abc import ABC
 from abc import abstractmethod
 from contextlib import asynccontextmanager
 
-class JobStatus(StrEnum):
-    PENDING = auto()
-    RUNNING = auto()
-    DONE = auto()
-    CANCELLED = auto()
-    FAILED = auto()
+class JobStatus(enum.StrEnum):
+    PENDING = enum.auto()
+    RUNNING = enum.auto()
+    DONE = enum.auto()
+    CANCELLED = enum.auto()
+    FAILED = enum.auto()
 
 class Base(DeclarativeBase):
     pass
@@ -33,7 +32,7 @@ class Job(Base):
     created_at:         Mapped[datetime]        = mapped_column(DateTime)
     started_at:         Mapped[datetime | None] = mapped_column(DateTime)
     finished_at:        Mapped[datetime | None] = mapped_column(DateTime)
-    status:             Mapped[str]             = mapped_column(String)
+    status:             Mapped[JobStatus]       = mapped_column(Enum(JobStatus, native_enum=False))
 
 class Agent(Base):
     __tablename__ = "agents"
@@ -92,6 +91,8 @@ class Api(ABC):
                 raise HTTPException(status_code=404, detail="Unknown agent")
 
     async def submit_result(self, agent_id, job_id, payload):
+        await self._submit_result(agent_id, job_id, payload)
+
         async with self.db_sessionmaker.begin() as session:
             stmt = (
                 update(Job)
@@ -108,8 +109,6 @@ class Api(ABC):
             if job is None:
                 raise HTTPException(status_code=404, detail="Invalid operation")
 
-            await self._submit_result(agent_id, job_id, payload)
-        
     @abstractmethod
     async def _submit_result(self, agent_id, job_id, payload):
         pass
@@ -165,10 +164,10 @@ class Api(ABC):
                 if job is None:
                     return
 
-            return {'job_id': job.id, 'payload': job.payload}
+            return {'job_id': job.id, 'payload': await self._prepare_payload(job.payload)}
 
     @abstractmethod
-    async def _validate_job(self, job_id, payload):
+    async def _prepare_payload(self, payload):
         pass
 
     async def add_job(self, payload):
@@ -183,6 +182,10 @@ class Api(ABC):
             job.created_at = datetime.now()
 
             session.add(job)
+
+    @abstractmethod
+    async def _validate_job(self, job_id, payload):
+        pass
 
 def create_app(api: Api):
 
@@ -242,5 +245,8 @@ class TestApi(Api):
 
     async def _validate_job(self, job_id, payload):
         pass
+
+    async def _prepare_payload(self, payload):
+        return payload
 
 app = create_app(TestApi())
