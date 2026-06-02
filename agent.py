@@ -10,127 +10,106 @@
 # ID do agente deve ter parcela que indique maquina (hostname?) e parcela UUID like, pro server poder identificar maquina e se o agent é novo ou não.
 
 import tomllib
-from multiprocessing import Process, Queue
+from multiprocessing import Process, SimpleQueue
 import uuid
 from abc import ABC, abstractmethod
 import asyncio
 import threading
-from enum import StrEnum, auto
+import enum
 import time
+from fastapi import status
 import httpx
 import socket
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+import tempfile
+from pathlib import Path
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy import create_engine, event, String, JSON, DateTime, ForeignKey, Enum, Boolean
+from sqlalchemy import select, update, func
+from datetime import datetime
+from typing import Any
 
-class Event(StrEnum):
-    START_JOB = auto()
-    DONE_JOB = auto()
-    FAILED_JOB = auto()
-    TERMINATE_WORKER = auto()
+from sqlalchemy.sql.expression import true
+
+class JobStatus(enum.StrEnum):
+    PENDING = enum.auto()
+    ASSIGNED  = enum.auto()
+    SUCCESS = enum.auto()
+    FAIL    = enum.auto()
+
+class Event(enum.StrEnum):
+    WORKER_IDLE = enum.auto()
+    JOB_DONE = enum.auto()
+    JOB_FAILED = enum.auto()
+
+class Base(DeclarativeBase):
+    pass
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id:                 Mapped[str]                     = mapped_column(String, primary_key=True)
+    payload:            Mapped[dict[str, Any]]          = mapped_column(JSON)
+    received_at:        Mapped[datetime]                = mapped_column(DateTime)
+    assigned_worker_id: Mapped[str | None]              = mapped_column(ForeignKey("workers.id"))
+    assigned_at:        Mapped[datetime | None]         = mapped_column(DateTime)
+    status:             Mapped[JobStatus]               = mapped_column(Enum(JobStatus, native_enum=False))
+    result:             Mapped[dict[str, Any] | None]   = mapped_column(JSON)
+
+
+class Worker(Base):
+    __tablename__ = "workers"
+
+    id:         Mapped[str]  = mapped_column(String, primary_key=True)
+    is_alive:   Mapped[bool] = mapped_column(Boolean)
 
 class Agent(ABC):
     def __init__(self, work_fn):
         self._init_config()
 
         self.work_fn = work_fn
-        self.jobs_queue = Queue()
-        self.events_queue = Queue()
-
-        self.workers = {}
-        self.pending_worker_terminations = 0
 
         self.id = None
         self.last_heartbeat = None
-        self.client = httpx.AsyncClient()
+        self.pending_terminations = 0
+        self.events_queue = SimpleQueue()
 
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread = threading.Thread(target=self._main_thread, daemon=True)
+
+        self.workers: dict[str, Process] = {}
+        self.job_queues: dict[str, SimpleQueue] = {}
+
+    def start(self):
         self.thread.start()
 
     def _init_config(self):
         with open("agent_config.toml", "rb") as f:
             self.config = tomllib.load(f)
 
-    def _spawn_workers(self, n):
-        for _ in range(n):
-            worker_id = str(uuid.uuid4())
+    def _main_thread(self):
+        asyncio.run(self._main_task())
 
-            process = Process(
-                target = type(self)._worker_main,
-                args = (worker_id, self.work_fn, self.jobs_queue, self.events_queue),
-            )
-            process.start()
+    async def _main_task(self):
+        server_url = self.config['server']['url']
+        async with httpx.AsyncClient(base_url = server_url) as client:
+            with tempfile.TemporaryDirectory() as runtime_dir:
+                db_path = Path(runtime_dir) / "maestro.db"
 
-            self.workers[worker_id] = process
+                db_engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+                db_sessionmaker = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+                async with db_engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
 
-    def _remove_dead_workers(self):
-        for proc_id, proc in list(self.workers.items()):
-            if not proc.is_alive():
-                proc.join()
-                proc.close()
-                self.workers.pop(proc_id)
+                await asyncio.gather(
+                    self.heartbeat(client),
+                    self.workers_monitor(db_sessionmaker),
+                    self.event_loop(client, db_sessionmaker),
+                )
 
-    def _terminate_workers(self, n):
-        for _ in range(n):
-            self.jobs_queue.put_nowait(None)
-
-    @staticmethod
-    def _worker_main(worker_id, work_fn, jobs_queue, events_queue):
-        while True:
-            job = jobs_queue.get()
-
-            if job is None:
-                events_queue.put({
-                    'worker_id': worker_id,
-                    'type': Event.TERMINATE_WORKER,
-                })
-
-                return
-            
-            events_queue.put({
-                'worker_id': worker_id,
-                'type': Event.START_JOB,
-                'job_id': job['job_id'],
-            })
-
-            try:
-                result = work_fn(job['payload'])
-
-                events_queue.put({
-                    'worker_id': worker_id,
-                    'type': Event.DONE_JOB,
-                    'job_id': job['job_id'],
-                    'result': result,
-                })
-
-            except Exception as e:
-                events_queue.put({
-                    'worker_id': worker_id,
-                    'type': Event.FAILED_JOB,
-                    'job_id': job['job_id'],
-                    'error': str(e),
-                })
-
-    @abstractmethod
-    def _validate_job(self, job_id, payload):
-        pass
-
-    @abstractmethod
-    def _submit_result(self, job_id, payload):
-        pass
-
-    def _run_loop(self):
-        asyncio.set_event_loop(self.loop)
-
-        asyncio.create_task(self.hearbeat())
-        asyncio.create_task(self.event_handler())
-
-        self.loop.run_forever()
-
-        # workers health, add/remove worker
-        # hearbeat
-        # process events, request work from server, send work to workers, get results from workers, send results to server, register to server
-
-    async def hearbeat(self):
-        interval = self.config['hearbeat']['interval']
+    async def heartbeat(self, client: httpx.AsyncClient):
+        # Envia heartbeat pro server. Pula envio caso alguma outra mensagem já tenha sido enviada pro server,
+        # já que qualquer mensagem também serve como heartbeat para o server.
+        interval = self.config['heartbeat']['interval']
         retry_interval = 5
 
         while True:
@@ -140,73 +119,212 @@ class Agent(ABC):
                 time_to_sleep = delay
             elif self.id is not None:
                 heartbeat_time = time.time()
-                response = await self.client.post(f"{self.config['server']['url']}/hearbeat/{self.id}")
+                response = await client.post(f"/heartbeat/{self.id}")
                 if response.is_success:
-                    self.last_hearbeat = heartbeat_time
-                    time_to_sleep = interval - (time.time()-heartbeat_time) # update since we had success
+                    self.last_heartbeat = heartbeat_time
+                    time_to_sleep = interval - (time.time()-heartbeat_time)
 
             await asyncio.sleep(time_to_sleep)
 
-    async def event_handler(self):
+    async def workers_monitor(self, db_sessionmaker: async_sessionmaker[AsyncSession]):
+        # Identifica workers mortos, redisponibiliza os jobs interrompidos e cria novos workers
+        poll_interval = 5
+        
         while True:
-            payload = {'hostname': socket.gethostname()}
-            ret = await self.client.post(f"{self.config['server']['url']}/register_agent", json=payload)
-            if ret.is_success:
-                self.id = ret.json()['agent_id']
-                if self.id is not None:
-                    break
+            cnt_alive_workers = 0
+            async with db_sessionmaker.begin() as session:
+                stmt = (
+                    select(Worker)
+                    .where(Worker.is_alive == True)
+                )
 
-            await asyncio.sleep(5)
+                alive_workers = (await session.execute(stmt)).scalars().all()
+                
+                for worker in alive_workers:
+                    if self.workers[worker.id].is_alive():
+                        cnt_alive_workers += 1
+                    else:
+                        worker.is_alive = False
+                        self.job_queues[worker.id] = None # deixar a queue ser fechada por ref count
+                                                          # para evitar erro caso alguma corrotina ainda
+                                                          # tente acessar a queue após o processo estar morto
 
-        pending_workers_termination = 0
+                        stmt = (
+                            update(Job)
+                            .where(
+                                Job.assigned_worker_id == worker.id,
+                                Job.status == JobStatus.ASSIGNED
+                            )
+                            .values(
+                                status = JobStatus.PENDING,
+                                assigned_at = None,
+                                assigned_worker_id = None
+                            )
+                            .returning(Job)
+                        )
 
-        while True:
-            # TODO: precisa adicionar lista de jobs pra controle, pra reencaminhar jobs dos
-            # processos que foram mortos (terminados ja ta ok, o problema é os que foram mortos
-            # de maneira não graciosa)
-            # self._remove_dead_workers()
+                        orphan_job = (await session.execute(stmt)).scalar_one_or_none()
 
-            workers_to_spawn = self.config['jobs']['n_workers'] - len(self.workers)
-            workers_to_terminate = -workers_to_spawn - pending_workers_termination
+            workers_to_spawn = self.config['jobs']['n_workers'] - cnt_alive_workers
+
             if workers_to_spawn > 0:
-                self._spawn_workers(workers_to_spawn)
-            elif workers_to_terminate > 0:
-                self._terminate_workers(workers_to_terminate)
-                pending_workers_termination += workers_to_terminate
+                async with db_sessionmaker.begin() as session:
+                    for _ in range(workers_to_spawn):
+                        worker_id = str(uuid.uuid4())
 
-            # TODO: melhorar esta lógica, vai ficar muito devagar pegar um, esperar sleep, pegar outro...
-            if self.jobs_queue.empty():
-                ret = await self.client.post(f"{self.config['server']['url']}/request_job/{self.id}")
-                if ret.is_success:
-                    self.last_hearbeat = time.time()
-                    job = ret.json()
-                    if job is not None:
-                        self.jobs_queue.put_nowait(job)
+                        job_queue = SimpleQueue()
+                        process = Process(
+                            target = type(self)._worker_main,
+                            args = (worker_id, self.work_fn, job_queue, self.events_queue),
+                        )
+                        process.start()
+
+                        self.workers[worker_id] = process
+                        self.job_queues[worker_id] = job_queue
+
+                        worker = Worker()
+                        worker.id = worker_id
+                        worker.is_alive = True
+
+                        session.add(worker)
+
+            workers_to_terminate = -workers_to_spawn
+            if workers_to_terminate > 0:
+                self.pending_terminations = workers_to_terminate
+
+            await asyncio.sleep(poll_interval)
+
+    @staticmethod
+    def _worker_main(worker_id, work_fn, jobs_queue: SimpleQueue, events_queue: SimpleQueue):
+        while True:
+            events_queue.put({
+                'type': Event.WORKER_IDLE,
+                'worker_id': worker_id,
+            })
+
+            job = jobs_queue.get()
+
+            if job['job_id'] is None:
+                return
 
             try:
-                event = self.events_queue.get_nowait()
+                result = work_fn(job['payload'])
 
-                if event['type'] == Event.DONE_JOB:
-                    # TODO
-                    pass
-                elif event['type'] == Event.FAILED_JOB:
-                    # TODO
-                    pass
-                elif event['type'] == Event.TERMINATE_WORKER:
-                    proc = self.workers[event['worker_id']]
-                    proc.join()
-                    proc.close()
-                    self.workers.pop(event['worker_id'])
+                events_queue.put({
+                    'type': Event.JOB_DONE,
+                    'worker_id': worker_id,
+                    'job_id': job['job_id'],
+                    'result': result,
+                })
 
-                    pending_workers_termination -= 1
-                    pass
-                elif event['type'] == Event.START_JOB:
-                    pass
-            except asyncio.QueueEmpty:
+            except Exception as e:
+                events_queue.put({
+                    'type': Event.JOB_FAILED,
+                    'worker_id': worker_id,
+                    'job_id': job['job_id'],
+                    'error': str(e),
+                })
+
+    async def event_loop(self, client: httpx.AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]):
+        # TODO: Cenários:
+        #  - worker envia IDLE event e morre enquanto espera queue: a corroutine dele pra obter
+        #    novo trabalho vai seguir rodando e vai obter um trabalho. No fim, sempre vamos ter
+        #    um trabalho sobrando na queue.
+        #  - worker pega trabalho da queue e morre antes de enviar evento de JOB_STARTED: o job
+        #    vai ficar em estado QUEUED para sempre e não vai ser pego por outros jobs.
+        retry_interval = 5
+
+        while True:
+            now = time.time()
+            response = await client.post('/register_agent', json={'hostname': socket.gethostname()})
+            if response.is_success:
+                self.last_heartbeat = now
+                self.id = response.json()['agent_id']
+                break
+            await asyncio.sleep(retry_interval)
+
+        while True:
+            # verificar criação/destruição de workers
+            event = await asyncio.to_thread(self.events_queue.get())
+
+            if event['type'] == Event.WORKER_IDLE:
+                asyncio.create_task(self._request_new_job(event['worker_id'], client, db_sessionmaker))
+
+            elif event['type'] == Event.JOB_DONE:
+                # TODO
                 pass
 
+            elif event['type'] == Event.JOB_FAILED:
+                # TODO
+                pass
 
-            await asyncio.sleep(5)
+    async def _request_new_job(self, worker_id, client: httpx.AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]):
+        retry_interval = 5
+
+        job_queue = self.job_queues[worker_id]
+
+        while self.workers[worker_id].is_alive():
+            if self.pending_terminations > 0:
+                self.pending_terminations -= 1
+                job_queue.put({'job_id': None})
+                self.workers[worker_id].join() # TODO: pode ficar preso aqui ou é paranoia
+                return
+            else:
+                async with db_sessionmaker.begin() as session:
+                    candidate = (
+                        select(Job.id)
+                        .where(Job.status == JobStatus.PENDING)
+                        .order_by(Job.received_at)
+                        .limit(1)
+                        .scalar_subquery()
+                    )
+
+                    stmt = (
+                        update(Job)
+                        .where(Job.id == candidate)
+                        .values(
+                            status = JobStatus.ASSIGNED,
+                            assigned_worker_id = worker_id,
+                            assigned_at = datetime.now()
+                        )
+                        .returning(Job)
+                    )
+
+                    job = (await session.execute(stmt)).scalar_one_or_none()
+                    if job is not None:
+                        job_queue.put({'job_id': job.id, 'payload': job.payload})
+                        return
+
+                now = time.time()
+                response = await client.post(f'/request_job/{self.id}')
+                if response.is_success:
+                    self.last_heartbeat = now
+                    job_json = response.json()
+                    if job_json is not None: # None indica nenhum trabalho disponível
+                        async with db_sessionmaker.begin() as session:    
+                            job = Job()
+
+                            now = datetime.now()
+
+                            job.id = job_json['job_id']
+                            job.received_at = now
+                            job.assigned_at = now
+                            job.status = JobStatus.ASSIGNED
+                            job.assigned_worker_id = worker_id
+                            job.payload = job_json['payload']
+                            
+                            session.add(job)
+                            job_queue.put({'job_id': job_json['job_id'], 'payload': job_json['payload']})
+                            return
+                
+            await asyncio.sleep(retry_interval)
+        else: # worker not alive
+            if self.pending_terminations > 0:
+                self.pending_terminations -= 1
+
+    @abstractmethod
+    def _submit_result(self, job_id, payload):
+        pass
 
 
 # TODO: backtest: talvez adicionar file FAIL se o job falhar, porque eu preciso enviar results pro server e tem q sinalizar de alguma forma q deu falha.

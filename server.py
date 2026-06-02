@@ -164,11 +164,7 @@ class Api(ABC):
                 if job is None:
                     return
 
-            return {'job_id': job.id, 'payload': await self._prepare_payload(job.payload)}
-
-    @abstractmethod
-    async def _prepare_payload(self, payload):
-        pass
+            return {'job_id': job.id, 'payload': job.payload}
 
     async def add_job(self, payload):
         await self._validate_job( payload)
@@ -239,14 +235,12 @@ def create_app(api: Api):
 
     return app
 
+
 class TestApi(Api):
     async def _submit_result(self, agent_id, job_id, payload):
         pass
 
     async def _validate_job(self, job_id, payload):
         pass
-
-    async def _prepare_payload(self, payload):
-        return payload
 
 app = create_app(TestApi())
