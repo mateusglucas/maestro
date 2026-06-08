@@ -9,6 +9,10 @@
 # sem estados permanentes, sql..., tudo efêmero. Agent morre, workers morrem.
 # ID do agente deve ter parcela que indique maquina (hostname?) e parcela UUID like, pro server poder identificar maquina e se o agent é novo ou não.
 
+# TODO: Usar modelo pydantic pros results em submit_result. pra dump seria result.model_dump_json()
+# TODO: talvez usar definicao de JobStatus compartilhada tambem entre server e agent. Conseguiria usar os enums direto no campo
+# de status dos results
+
 import tomllib
 from multiprocessing import Process, SimpleQueue
 import uuid
@@ -28,18 +32,23 @@ from sqlalchemy import create_engine, event, String, JSON, DateTime, ForeignKey,
 from sqlalchemy import select, update, func
 from datetime import datetime
 from typing import Any
+import shutil
+import json
+import tarfile
+from contextlib import nullcontext
+
 
 from sqlalchemy.sql.expression import true
 
 class JobStatus(enum.StrEnum):
     PENDING = enum.auto()
     ASSIGNED  = enum.auto()
-    SUCCESS = enum.auto()
-    FAIL    = enum.auto()
+    COMPLETED = enum.auto()
+    FAILED    = enum.auto()
 
 class Event(enum.StrEnum):
     WORKER_IDLE = enum.auto()
-    JOB_DONE = enum.auto()
+    JOB_COMPLETED = enum.auto()
     JOB_FAILED = enum.auto()
 
 class Base(DeclarativeBase):
@@ -49,13 +58,11 @@ class Job(Base):
     __tablename__ = "jobs"
 
     id:                 Mapped[str]                     = mapped_column(String, primary_key=True)
-    payload:            Mapped[dict[str, Any]]          = mapped_column(JSON)
+    parameters:         Mapped[dict[str, Any]]          = mapped_column(JSON)
     received_at:        Mapped[datetime]                = mapped_column(DateTime)
     assigned_worker_id: Mapped[str | None]              = mapped_column(ForeignKey("workers.id"))
     assigned_at:        Mapped[datetime | None]         = mapped_column(DateTime)
     status:             Mapped[JobStatus]               = mapped_column(Enum(JobStatus, native_enum=False))
-    result:             Mapped[dict[str, Any] | None]   = mapped_column(JSON)
-
 
 class Worker(Base):
     __tablename__ = "workers"
@@ -102,8 +109,8 @@ class Agent(ABC):
 
                 await asyncio.gather(
                     self.heartbeat(client),
-                    self.workers_monitor(db_sessionmaker),
-                    self.event_loop(client, db_sessionmaker),
+                    self.workers_monitor(db_sessionmaker, runtime_dir),
+                    self.event_loop(client, db_sessionmaker, runtime_dir),
                 )
 
     async def heartbeat(self, client: httpx.AsyncClient):
@@ -126,7 +133,7 @@ class Agent(ABC):
 
             await asyncio.sleep(time_to_sleep)
 
-    async def workers_monitor(self, db_sessionmaker: async_sessionmaker[AsyncSession]):
+    async def workers_monitor(self, db_sessionmaker: async_sessionmaker[AsyncSession], runtime_dir: Path):
         # Identifica workers mortos, redisponibiliza os jobs interrompidos e cria novos workers
         poll_interval = 5
         
@@ -175,7 +182,7 @@ class Agent(ABC):
                         job_queue = SimpleQueue()
                         process = Process(
                             target = type(self)._worker_main,
-                            args = (worker_id, self.work_fn, job_queue, self.events_queue),
+                            args = (worker_id, self.work_fn, job_queue, self.events_queue, runtime_dir),
                         )
                         process.start()
 
@@ -195,7 +202,7 @@ class Agent(ABC):
             await asyncio.sleep(poll_interval)
 
     @staticmethod
-    def _worker_main(worker_id, work_fn, jobs_queue: SimpleQueue, events_queue: SimpleQueue):
+    def _worker_main(worker_id, work_fn, jobs_queue: SimpleQueue, events_queue: SimpleQueue, runtime_dir: Path):
         while True:
             events_queue.put({
                 'type': Event.WORKER_IDLE,
@@ -208,10 +215,16 @@ class Agent(ABC):
                 return
 
             try:
-                result = work_fn(job['payload'])
+                artifact_path: Path =  runtime_dir / 'artifacts' / job['job_id']
+                if artifact_path.exists():
+                    shutil.rmtree(artifact_path)
+
+                artifact_path.mkdir(parents = True, exist_ok = False)
+
+                result = work_fn(artifact_path, **job['parameters'])
 
                 events_queue.put({
-                    'type': Event.JOB_DONE,
+                    'type': Event.JOB_COMPLETED,
                     'worker_id': worker_id,
                     'job_id': job['job_id'],
                     'result': result,
@@ -225,7 +238,7 @@ class Agent(ABC):
                     'error': str(e),
                 })
 
-    async def event_loop(self, client: httpx.AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]):
+    async def event_loop(self, client: httpx.AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession], runtime_dir: Path):
         # TODO: Cenários:
         #  - worker envia IDLE event e morre enquanto espera queue: a corroutine dele pra obter
         #    novo trabalho vai seguir rodando e vai obter um trabalho. No fim, sempre vamos ter
@@ -245,18 +258,131 @@ class Agent(ABC):
 
         while True:
             # verificar criação/destruição de workers
-            event = await asyncio.to_thread(self.events_queue.get())
+            event = await asyncio.to_thread(self.events_queue.get)
 
             if event['type'] == Event.WORKER_IDLE:
                 asyncio.create_task(self._request_new_job(event['worker_id'], client, db_sessionmaker))
 
-            elif event['type'] == Event.JOB_DONE:
-                # TODO
-                pass
+            elif event['type'] == Event.JOB_COMPLETED:
+                asyncio.create_task(self._send_completed_result(event['worker_id'], 
+                                                                event['job_id'], 
+                                                                event['result'], 
+                                                                client, 
+                                                                db_sessionmaker, 
+                                                                runtime_dir))
 
             elif event['type'] == Event.JOB_FAILED:
-                # TODO
-                pass
+                asyncio.create_task(self._send_error_result(event['worker_id'], 
+                                                            event['job_id'], 
+                                                            event['error'], 
+                                                            client, 
+                                                            db_sessionmaker))
+
+            else:
+                raise RuntimeError(f'Unknown event {event['type']}.')
+
+    async def _send_completed_result(self, worker_id, job_id: str, result, client: httpx.AsyncClient, db_sessionmaker, runtime_dir: Path):
+        async with db_sessionmaker.begin() as session:
+            stmt = (
+                update(Job)
+                .where(
+                    Job.id == job_id,
+                    Job.status == JobStatus.ASSIGNED,
+                    Job.assigned_worker_id == worker_id
+                )
+                .values(
+                    status = JobStatus.COMPLETED
+                )
+                .returning(Job)
+            )
+
+            (await session.execute(stmt)).scalar_one()
+
+        retry_interval = 5
+
+        # TODO: usar pydantic definido no server
+        result_json = {'status': 'failed', # TODO: usar enum definido no server
+                       'results': result}
+
+        data = {
+            'results': json.dumps(result_json)
+        }
+
+        has_artifact = False
+        artifacts_dir = runtime_dir / 'artifacts' / job_id
+        archive_path = runtime_dir / 'tar' / f'{job_id}.tar.zst'
+
+        if any(artifacts_dir.iterdir()):
+            has_artifact = True
+
+            archive_path.parent.mkdir(parents = True, exist_ok = True)
+
+            await asyncio.to_thread(
+                self.create_archive,
+                artifacts_dir,
+                archive_path,
+            )
+
+        with (open(archive_path) if has_artifact else nullcontext()) as file:
+            while True:
+                if file is not None:
+                    file.seek(0)
+                    files = {"artifact": file}
+                else:
+                    files = None
+
+                now = time.time()
+                response = await client.post(f'/submit_result/{self.id}/{job_id}', data = data, files=files)
+                if response.is_success:
+                    self.last_heartbeat = now
+                    break
+
+                await asyncio.sleep(retry_interval)
+
+        archive_path.unlink()
+        await asyncio.to_tread(shutil.rmtree, artifacts_dir)
+
+    @staticmethod
+    def create_archive(source_dir: Path, archive_path: Path) -> None:
+        with tarfile.open(archive_path, mode="w:zst") as tar:
+            tar.add(source_dir, arcname=".")
+
+    async def _send_error_result(self, worker_id, job_id, error, client: httpx.AsyncClient, db_sessionmaker):
+        async with db_sessionmaker.begin() as session:
+            stmt = (
+                update(Job)
+                .where(
+                    Job.id == job_id,
+                    Job.status == JobStatus.ASSIGNED,
+                    Job.assigned_worker_id == worker_id
+                )
+                .values(
+                    status = JobStatus.FAILED
+                )
+                .returning(Job)
+            )
+
+            (await session.execute(stmt)).scalar_one()
+
+        retry_interval = 5
+
+        # TODO: usar pydantic definido no server
+        result_json = {'status': 'failed', # TODO: usar enum definido no server
+                       'error': error}
+
+        data = {
+            'results': json.dumps(result_json)
+        }
+
+        while True:
+            now = time.time()
+            response = await client.post(f'/submit_result/{self.id}/{job_id}', data = data)
+            if response.is_success:
+                self.last_heartbeat = now
+                return
+
+            await asyncio.sleep(retry_interval)
+
 
     async def _request_new_job(self, worker_id, client: httpx.AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]):
         retry_interval = 5
@@ -292,7 +418,7 @@ class Agent(ABC):
 
                     job = (await session.execute(stmt)).scalar_one_or_none()
                     if job is not None:
-                        job_queue.put({'job_id': job.id, 'payload': job.payload})
+                        job_queue.put({'job_id': job.id, 'parameters': job.parameters})
                         return
 
                 now = time.time()
@@ -311,20 +437,15 @@ class Agent(ABC):
                             job.assigned_at = now
                             job.status = JobStatus.ASSIGNED
                             job.assigned_worker_id = worker_id
-                            job.payload = job_json['payload']
+                            job.parameters = job_json['parameters']
                             
                             session.add(job)
-                            job_queue.put({'job_id': job_json['job_id'], 'payload': job_json['payload']})
+                            job_queue.put({'job_id': job_json['job_id'], 'parameters': job_json['parameters']})
                             return
                 
             await asyncio.sleep(retry_interval)
         else: # worker not alive
             if self.pending_terminations > 0:
                 self.pending_terminations -= 1
-
-    @abstractmethod
-    def _submit_result(self, job_id, payload):
-        pass
-
 
 # TODO: backtest: talvez adicionar file FAIL se o job falhar, porque eu preciso enviar results pro server e tem q sinalizar de alguma forma q deu falha.

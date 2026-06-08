@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Body
+from os import name
+from fastapi import FastAPI, HTTPException, Body, Form, File, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import String, JSON, DateTime, ForeignKey, Enum
+from sqlalchemy import String, JSON, DateTime, ForeignKey, Enum, Boolean
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -9,14 +10,16 @@ import enum
 from datetime import datetime, timedelta
 from typing import Any
 import uuid
-from abc import ABC
-from abc import abstractmethod
 from contextlib import asynccontextmanager
+import aiofiles
+from pathlib import Path
+
+ARTIFACTS_DIR = Path('artifacts')
 
 class JobStatus(enum.StrEnum):
     PENDING = enum.auto()
-    RUNNING = enum.auto()
-    DONE = enum.auto()
+    ASSIGNED = enum.auto()
+    COMPLETED = enum.auto()
     CANCELLED = enum.auto()
     FAILED = enum.auto()
 
@@ -26,13 +29,16 @@ class Base(DeclarativeBase):
 class Job(Base):
     __tablename__ = "jobs"
 
-    id:                 Mapped[str]             = mapped_column(String, primary_key=True)
-    payload:            Mapped[dict[str, Any]]  = mapped_column(JSON)
-    assigned_agent_id:  Mapped[str | None]      = mapped_column(ForeignKey("agents.id"))
-    created_at:         Mapped[datetime]        = mapped_column(DateTime)
-    started_at:         Mapped[datetime | None] = mapped_column(DateTime)
-    finished_at:        Mapped[datetime | None] = mapped_column(DateTime)
-    status:             Mapped[JobStatus]       = mapped_column(Enum(JobStatus, native_enum=False))
+    id:                 Mapped[str]                     = mapped_column(String, primary_key=True)
+    parameters:         Mapped[dict[str, Any]]          = mapped_column(JSON)
+    assigned_agent_id:  Mapped[str | None]              = mapped_column(ForeignKey("agents.id"))
+    created_at:         Mapped[datetime]                = mapped_column(DateTime)
+    started_at:         Mapped[datetime | None]         = mapped_column(DateTime)
+    finished_at:        Mapped[datetime | None]         = mapped_column(DateTime)
+    status:             Mapped[JobStatus]               = mapped_column(Enum(JobStatus, native_enum=False))
+    error:              Mapped[str| None]               = mapped_column(String)
+    results:            Mapped[dict[str, Any] | None]   = mapped_column(JSON)
+    artifact_present:   Mapped[bool | None]             = mapped_column(Boolean)
 
 class Agent(Base):
     __tablename__ = "agents"
@@ -42,7 +48,7 @@ class Agent(Base):
     first_seen: Mapped[datetime]    = mapped_column(DateTime)
     last_seen:  Mapped[datetime]    = mapped_column(DateTime)
 
-class Api(ABC):
+class Api:
     def __init__(self):
         self._init_config()
 
@@ -90,17 +96,20 @@ class Api(ABC):
             if agent is None:
                 raise HTTPException(status_code=404, detail="Unknown agent")
 
-    async def submit_result(self, agent_id, job_id, payload):
-        await self._submit_result(agent_id, job_id, payload)
+    async def submit_result(self, agent_id, job_id, results, artifact: UploadFile | None):
+        await self._receive_artifact(artifact)
 
         async with self.db_sessionmaker.begin() as session:
             stmt = (
                 update(Job)
                 .where(Job.id == job_id,
                        Job.assigned_agent_id == agent_id,
-                       Job.status == JobStatus.RUNNING)
+                       Job.status == JobStatus.ASSIGNED)
                 .values(finished_at = datetime.now(),
-                        status = JobStatus.Done)
+                        results = results['results'],
+                        error = results['error'],
+                        artifact_present = artifact is not None,
+                        status = results['status'])
                 .returning(Job)
             )
 
@@ -109,9 +118,18 @@ class Api(ABC):
             if job is None:
                 raise HTTPException(status_code=404, detail="Invalid operation")
 
-    @abstractmethod
-    async def _submit_result(self, agent_id, job_id, payload):
-        pass
+    async def _receive_artifact(self, artifact):
+        if artifact is not None:
+            ARTIFACTS_DIR.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            artifact_path = ARTIFACTS_DIR / artifact.filename
+
+            async with aiofiles.open(artifact_path, "wb") as f:
+                while chunk := await artifact.read(1024 * 1024):
+                    await f.write(chunk)
 
     async def request_job(self, agent_id):
         now = datetime.now()
@@ -130,7 +148,7 @@ class Api(ABC):
                 .where(Job.id == candidate)
                 .values(assigned_agent_id = agent_id,
                         started_at = now,
-                        status = JobStatus.RUNNING)
+                        status = JobStatus.ASSIGNED)
                 .returning(Job)
             )
 
@@ -144,7 +162,7 @@ class Api(ABC):
                 candidate = (
                     select(Job.id)
                     .join(Agent)
-                    .where(Job.status == JobStatus.RUNNING,
+                    .where(Job.status == JobStatus.ASSIGNED,
                            Agent.last_seen < cutoff)
                     .order_by(Job.created_at)
                     .limit(1)
@@ -164,24 +182,18 @@ class Api(ABC):
                 if job is None:
                     return
 
-            return {'job_id': job.id, 'payload': job.payload}
+            return {'job_id': job.id, 'parameters': job.parameters}
 
-    async def add_job(self, payload):
-        await self._validate_job( payload)
-
+    async def add_job(self, parameters):
         async with self.db_sessionmaker.begin() as session:
             job = Job()
 
             job.id = str(uuid.uuid4())
-            job.payload = payload
+            job.parameters = parameters
             job.status = JobStatus.PENDING
             job.created_at = datetime.now()
 
             session.add(job)
-
-    @abstractmethod
-    async def _validate_job(self, job_id, payload):
-        pass
 
 def create_app(api: Api):
 
@@ -218,29 +230,28 @@ def create_app(api: Api):
 
 
 
+    class JobResults(BaseModel):
+        status: JobStatus
+        error: str | None  = None
+        results: dict[str, Any] | None = None
+
     @app.post("/submit_result/{agent_id}/{job_id}")
-    async def submit_result(agent_id: str, job_id: str, payload: bytes = Body(media_type="application/octet-stream")):
+    async def submit_result(agent_id: str, job_id: str, results: str = Form(), artifact: UploadFile | None = File(None)) :
+        results = JobResults.model_validate_json(results)
+  
         await api.heartbeat(agent_id)
 
-        return await api.submit_result(agent_id, job_id, payload)
+        return await api.submit_result(agent_id, job_id, results, artifact)
 
 
 
     class AddJobRequest(BaseModel):
-        payload: dict[str, Any]
+        parameters: dict[str, Any]
 
     @app.post("/add_job")
     async def add_job(req: AddJobRequest):
-        return await api.add_job(req.payload)
+        return await api.add_job(req.parameters)
 
     return app
 
-
-class TestApi(Api):
-    async def _submit_result(self, agent_id, job_id, payload):
-        pass
-
-    async def _validate_job(self, job_id, payload):
-        pass
-
-app = create_app(TestApi())
+app = create_app(Api())
