@@ -89,6 +89,9 @@ class Agent(ABC):
     def start(self):
         self.thread.start()
 
+    def join(self):
+        self.thread.join()
+
     def _init_config(self):
         with open("agent_config.toml", "rb") as f:
             self.config = tomllib.load(f)
@@ -239,12 +242,7 @@ class Agent(ABC):
                 })
 
     async def event_loop(self, client: httpx.AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession], runtime_dir: Path):
-        # TODO: Cenários:
-        #  - worker envia IDLE event e morre enquanto espera queue: a corroutine dele pra obter
-        #    novo trabalho vai seguir rodando e vai obter um trabalho. No fim, sempre vamos ter
-        #    um trabalho sobrando na queue.
-        #  - worker pega trabalho da queue e morre antes de enviar evento de JOB_STARTED: o job
-        #    vai ficar em estado QUEUED para sempre e não vai ser pego por outros jobs.
+
         retry_interval = 5
 
         while True:
@@ -301,7 +299,7 @@ class Agent(ABC):
         retry_interval = 5
 
         # TODO: usar pydantic definido no server
-        result_json = {'status': 'failed', # TODO: usar enum definido no server
+        result_json = {'status': 'completed', # TODO: usar enum definido no server
                        'results': result}
 
         data = {
@@ -339,8 +337,8 @@ class Agent(ABC):
 
                 await asyncio.sleep(retry_interval)
 
-        archive_path.unlink()
-        await asyncio.to_tread(shutil.rmtree, artifacts_dir)
+        archive_path.unlink(missing_ok = True)
+        await asyncio.to_thread(shutil.rmtree, artifacts_dir)
 
     @staticmethod
     def create_archive(source_dir: Path, archive_path: Path) -> None:

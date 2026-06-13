@@ -1,5 +1,5 @@
 from os import name
-from fastapi import FastAPI, HTTPException, Body, Form, File, UploadFile
+from fastapi import FastAPI, HTTPException, Form, File, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import String, JSON, DateTime, ForeignKey, Enum, Boolean
 from sqlalchemy import select, update
@@ -22,6 +22,11 @@ class JobStatus(enum.StrEnum):
     COMPLETED = enum.auto()
     CANCELLED = enum.auto()
     FAILED = enum.auto()
+
+class JobResults(BaseModel):
+    status: JobStatus
+    error: str | None  = None
+    results: dict[str, Any] | None = None
 
 class Base(DeclarativeBase):
     pass
@@ -96,7 +101,7 @@ class Api:
             if agent is None:
                 raise HTTPException(status_code=404, detail="Unknown agent")
 
-    async def submit_result(self, agent_id, job_id, results, artifact: UploadFile | None):
+    async def submit_result(self, agent_id, job_id, results: JobResults, artifact: UploadFile | None):
         await self._receive_artifact(artifact)
 
         async with self.db_sessionmaker.begin() as session:
@@ -106,10 +111,10 @@ class Api:
                        Job.assigned_agent_id == agent_id,
                        Job.status == JobStatus.ASSIGNED)
                 .values(finished_at = datetime.now(),
-                        results = results['results'],
-                        error = results['error'],
+                        results = results.results,
+                        error = results.error,
                         artifact_present = artifact is not None,
-                        status = results['status'])
+                        status = results.status)
                 .returning(Job)
             )
 
@@ -230,11 +235,6 @@ def create_app(api: Api):
 
 
 
-    class JobResults(BaseModel):
-        status: JobStatus
-        error: str | None  = None
-        results: dict[str, Any] | None = None
-
     @app.post("/submit_result/{agent_id}/{job_id}")
     async def submit_result(agent_id: str, job_id: str, results: str = Form(), artifact: UploadFile | None = File(None)) :
         results = JobResults.model_validate_json(results)
@@ -253,5 +253,3 @@ def create_app(api: Api):
         return await api.add_job(req.parameters)
 
     return app
-
-app = create_app(Api())
