@@ -1,4 +1,3 @@
-from os import name
 from fastapi import FastAPI, HTTPException, Form, File, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import String, JSON, DateTime, ForeignKey, Enum, Boolean
@@ -45,6 +44,7 @@ class Agent(Base):
 class Api:
     def __init__(self):
         self._init_config()
+        self.start_time = None
 
     def _init_config(self):
         with open("server_config.toml", "rb") as f:
@@ -129,6 +129,9 @@ class Api:
         now = datetime.now()
 
         async with self.db_sessionmaker.begin() as session:
+            # Prefer never-assigned jobs before reclaiming stalled jobs. This gives
+            # expired agents the longest possible window to recover and submit results.
+
             candidate = (
                 select(Job.id)
                 .where(Job.status == JobStatus.PENDING)
@@ -148,10 +151,11 @@ class Api:
 
             job = (await session.execute(stmt)).scalar_one_or_none()
 
-            if job is None:
-                # search for any stalled job
-                timeout = self.config['heartbeat']['timeout']
-                cutoff = now - timedelta(seconds=timeout)
+            # Start looking for stalled jobs only after server being up for more than
+            # timeout seconds, to give time to receive heartbeats of agents still alive
+            timeout = timedelta(seconds=self.config['heartbeat']['timeout'])
+            if job is None and self.start_time is not None and now-self.start_time > timeout:
+                cutoff = now - timeout
 
                 candidate = (
                     select(Job.id)
@@ -173,8 +177,8 @@ class Api:
 
                 job = (await session.execute(stmt)).scalar_one_or_none()
 
-                if job is None:
-                    return
+            if job is None:
+                return
 
             return {'job_id': job.id, 'parameters': job.parameters}
 
@@ -194,6 +198,8 @@ def create_app(api: Api):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await api.init_database()
+
+        api.start_time = datetime.now()
 
         yield
 
