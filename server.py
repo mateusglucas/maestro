@@ -6,7 +6,6 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 import tomllib
-import enum
 from datetime import datetime, timedelta
 from typing import Any
 import uuid
@@ -14,19 +13,9 @@ from contextlib import asynccontextmanager
 import aiofiles
 from pathlib import Path
 
+from common import JobResults, JobStatus
+
 ARTIFACTS_DIR = Path('artifacts')
-
-class JobStatus(enum.StrEnum):
-    PENDING = enum.auto()
-    ASSIGNED = enum.auto()
-    COMPLETED = enum.auto()
-    CANCELLED = enum.auto()
-    FAILED = enum.auto()
-
-class JobResults(BaseModel):
-    status: JobStatus
-    error: str | None  = None
-    results: dict[str, Any] | None = None
 
 class Base(DeclarativeBase):
     pass

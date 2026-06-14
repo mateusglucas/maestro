@@ -39,6 +39,7 @@ Se um worker morrer no meio de um job, o agent detecta a falha, devolve o job ao
 |---------|-------|
 | `server.py` | API FastAPI, modelos SQLAlchemy (`Job`, `Agent`), fila e persistência |
 | `agent.py` | Classe base `Agent`: heartbeat, pool de workers, fila local de jobs |
+| `common.py` | Tipos compartilhados entre server e agent (`JobStatus`, `JobResults`) |
 | `server_config.toml` | URL do banco e timeout de heartbeat do server |
 | `agent_config.toml` | URL do server, intervalo de heartbeat e número de workers |
 | `test_server.py` | Entry point ASGI do server |
@@ -145,7 +146,6 @@ Artefatos gerados pelo worker são compactados em tarball `.tar.zst` e enviados 
 
 Maestro está em desenvolvimento ativo. Alguns pontos ainda em evolução:
 
-- Compartilhar tipos (`JobStatus`, modelos Pydantic) entre server e agent
 - Controle dinâmico do número de workers (endpoint ou CLI)
 - Gerador de jobs de teste (`test_jobs_generator.py`)
 - Correções menores pendentes no agent (ex.: status de sucesso em `_send_completed_result`)
@@ -156,6 +156,7 @@ Maestro está em desenvolvimento ativo. Alguns pontos ainda em evolução:
 maestro/
 ├── server.py              # Server e modelos de dados
 ├── agent.py               # Agent e workers
+├── common.py              # Tipos compartilhados
 ├── server_config.toml
 ├── agent_config.toml
 ├── test_server.py         # App ASGI

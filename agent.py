@@ -9,10 +9,6 @@
 # sem estados permanentes, sql..., tudo efêmero. Agent morre, workers morrem.
 # ID do agente deve ter parcela que indique maquina (hostname?) e parcela UUID like, pro server poder identificar maquina e se o agent é novo ou não.
 
-# TODO: Usar modelo pydantic pros results em submit_result. pra dump seria result.model_dump_json()
-# TODO: talvez usar definicao de JobStatus compartilhada tambem entre server e agent. Conseguiria usar os enums direto no campo
-# de status dos results
-
 import tomllib
 from multiprocessing import Process, SimpleQueue
 import uuid
@@ -32,20 +28,15 @@ from sqlalchemy import select, update, func
 from datetime import datetime
 from typing import Any
 import shutil
-import json
 import tarfile
 from contextlib import nullcontext
 
 import pyzstd
 
+from common import JobResults, JobStatus
+
 
 from sqlalchemy.sql.expression import true
-
-class JobStatus(enum.StrEnum):
-    PENDING = enum.auto()
-    ASSIGNED  = enum.auto()
-    COMPLETED = enum.auto()
-    FAILED    = enum.auto()
 
 class Event(enum.StrEnum):
     WORKER_IDLE = enum.auto()
@@ -319,12 +310,10 @@ class Agent:
 
         retry_interval = 5
 
-        # TODO: usar pydantic definido no server
-        result_json = {'status': 'completed', # TODO: usar enum definido no server
-                       'results': result}
+        result = JobResults(status=JobStatus.COMPLETED, results=result)
 
         data = {
-            'results': json.dumps(result_json)
+            'results': result.model_dump_json()
         }
 
         has_artifact = False
@@ -390,12 +379,10 @@ class Agent:
 
         retry_interval = 5
 
-        # TODO: usar pydantic definido no server
-        result_json = {'status': 'failed', # TODO: usar enum definido no server
-                       'error': error}
+        result = JobResults(status=JobStatus.FAILED, error=error)
 
         data = {
-            'results': json.dumps(result_json)
+            'results': result.model_dump_json()
         }
 
         while True:
@@ -421,7 +408,7 @@ class Agent:
             if self.pending_terminations > 0:
                 self.pending_terminations -= 1
                 job_queue.put({'job_id': None})
-                self.workers[worker_id].join() # TODO: pode ficar preso aqui ou é paranoia
+                await asyncio.to_thread(self.workers[worker_id].join)
                 return
             else:
                 async with db_sessionmaker.begin() as session:
