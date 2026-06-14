@@ -1,4 +1,5 @@
 # TODO: implementar aumento/redução de workers dinâmico
+# TODO: atualizar README após inclusão de pasta samples
 
 import tomllib
 from multiprocessing import Process, SimpleQueue
