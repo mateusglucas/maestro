@@ -110,7 +110,8 @@ class Agent:
         server_url = self.config['server']['url']
         async with httpx.AsyncClient(base_url = server_url) as client:
             with tempfile.TemporaryDirectory() as runtime_dir:
-                db_path = Path(runtime_dir) / "maestro.db"
+                runtime_dir = Path(runtime_dir)
+                db_path = runtime_dir / "maestro.db"
 
                 db_engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
                 db_sessionmaker = async_sessionmaker(bind=db_engine, expire_on_commit=False)
