@@ -16,7 +16,6 @@
 import tomllib
 from multiprocessing import Process, SimpleQueue
 import uuid
-from abc import ABC, abstractmethod
 import asyncio
 import threading
 import enum
@@ -70,7 +69,7 @@ class Worker(Base):
     id:         Mapped[str]  = mapped_column(String, primary_key=True)
     is_alive:   Mapped[bool] = mapped_column(Boolean)
 
-class Agent(ABC):
+class Agent:
     def __init__(self, work_fn):
         self._init_config()
 
@@ -82,6 +81,7 @@ class Agent(ABC):
         self.events_queue = SimpleQueue()
 
         self.thread = threading.Thread(target=self._main_thread, daemon=True)
+        self.thread_exception = None
 
         self.workers: dict[str, Process] = {}
         self.job_queues: dict[str, SimpleQueue] = {}
@@ -92,12 +92,19 @@ class Agent(ABC):
     def join(self):
         self.thread.join()
 
+        if self.thread_exception is not None:
+            raise self.thread_exception
+
     def _init_config(self):
         with open("agent_config.toml", "rb") as f:
             self.config = tomllib.load(f)
 
     def _main_thread(self):
-        asyncio.run(self._main_task())
+        try:
+            asyncio.run(self._main_task())
+        except BaseException as e:
+            self.thread_exception = e
+            raise
 
     async def _main_task(self):
         server_url = self.config['server']['url']
@@ -110,11 +117,10 @@ class Agent(ABC):
                 async with db_engine.begin() as conn:
                     await conn.run_sync(Base.metadata.create_all)
 
-                await asyncio.gather(
-                    self.heartbeat(client),
-                    self.workers_monitor(db_sessionmaker, runtime_dir),
-                    self.event_loop(client, db_sessionmaker, runtime_dir),
-                )
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self.heartbeat(client))
+                    tg.create_task(self.workers_monitor(db_sessionmaker, runtime_dir))
+                    tg.create_task(self.event_loop(client, db_sessionmaker, runtime_dir))
 
     async def heartbeat(self, client: httpx.AsyncClient):
         # Envia heartbeat pro server. Pula envio caso alguma outra mensagem já tenha sido enviada pro server,
@@ -186,6 +192,7 @@ class Agent(ABC):
                         process = Process(
                             target = type(self)._worker_main,
                             args = (worker_id, self.work_fn, job_queue, self.events_queue, runtime_dir),
+                            daemon = True,
                         )
                         process.start()
 
@@ -254,30 +261,31 @@ class Agent(ABC):
                 break
             await asyncio.sleep(retry_interval)
 
-        while True:
-            # verificar criação/destruição de workers
-            event = await asyncio.to_thread(self.events_queue.get)
+        async with asyncio.TaskGroup() as tg:
+            while True:
+                # verificar criação/destruição de workers
+                event = await asyncio.to_thread(self.events_queue.get)
 
-            if event['type'] == Event.WORKER_IDLE:
-                asyncio.create_task(self._request_new_job(event['worker_id'], client, db_sessionmaker))
+                if event['type'] == Event.WORKER_IDLE:
+                    tg.create_task(self._request_new_job(event['worker_id'], client, db_sessionmaker))
 
-            elif event['type'] == Event.JOB_COMPLETED:
-                asyncio.create_task(self._send_completed_result(event['worker_id'], 
+                elif event['type'] == Event.JOB_COMPLETED:
+                    tg.create_task(self._send_completed_result(event['worker_id'], 
+                                                                    event['job_id'], 
+                                                                    event['result'], 
+                                                                    client, 
+                                                                    db_sessionmaker, 
+                                                                    runtime_dir))
+
+                elif event['type'] == Event.JOB_FAILED:
+                    tg.create_task(self._send_error_result(event['worker_id'], 
                                                                 event['job_id'], 
-                                                                event['result'], 
+                                                                event['error'], 
                                                                 client, 
-                                                                db_sessionmaker, 
-                                                                runtime_dir))
+                                                                db_sessionmaker))
 
-            elif event['type'] == Event.JOB_FAILED:
-                asyncio.create_task(self._send_error_result(event['worker_id'], 
-                                                            event['job_id'], 
-                                                            event['error'], 
-                                                            client, 
-                                                            db_sessionmaker))
-
-            else:
-                raise RuntimeError(f'Unknown event {event['type']}.')
+                else:
+                    raise RuntimeError(f'Unknown event {event['type']}.')
 
     async def _send_completed_result(self, worker_id, job_id: str, result, client: httpx.AsyncClient, db_sessionmaker, runtime_dir: Path):
         async with db_sessionmaker.begin() as session:
@@ -321,7 +329,7 @@ class Agent(ABC):
                 archive_path,
             )
 
-        with (open(archive_path) if has_artifact else nullcontext()) as file:
+        with (open(archive_path, "rb") if has_artifact else nullcontext()) as file:
             while True:
                 if file is not None:
                     file.seek(0)
