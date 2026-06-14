@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 import tempfile
 from pathlib import Path
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
-from sqlalchemy import create_engine, event, String, JSON, DateTime, ForeignKey, Enum, Boolean
+from sqlalchemy import create_engine, event, String, JSON, DateTime, ForeignKey, Enum, Boolean, Integer
 from sqlalchemy import select, update, func
 from datetime import datetime
 from typing import Any
@@ -69,6 +69,7 @@ class Worker(Base):
     __tablename__ = "workers"
 
     id:         Mapped[str]  = mapped_column(String, primary_key=True)
+    pid:        Mapped[int]  = mapped_column(Integer)
     is_alive:   Mapped[bool] = mapped_column(Boolean)
 
 class Agent:
@@ -138,10 +139,14 @@ class Agent:
                 time_to_sleep = delay
             elif self.id is not None:
                 heartbeat_time = time.time()
-                response = await client.post(f"/heartbeat/{self.id}")
-                if response.is_success:
-                    self.last_heartbeat = heartbeat_time
-                    time_to_sleep = interval - (time.time()-heartbeat_time)
+                try:
+                    response = await client.post(f"/heartbeat/{self.id}")
+                except httpx.RequestError:
+                    pass
+                else:
+                    if response.is_success:
+                        self.last_heartbeat = heartbeat_time
+                        time_to_sleep = interval - (time.time()-heartbeat_time)
 
             await asyncio.sleep(time_to_sleep)
 
@@ -204,6 +209,7 @@ class Agent:
 
                         worker = Worker()
                         worker.id = worker_id
+                        worker.pid = process.pid
                         worker.is_alive = True
 
                         session.add(worker)
@@ -257,11 +263,15 @@ class Agent:
 
         while True:
             now = time.time()
-            response = await client.post('/register_agent', json={'hostname': socket.gethostname()})
-            if response.is_success:
-                self.last_heartbeat = now
-                self.id = response.json()['agent_id']
-                break
+            try:
+                response = await client.post('/register_agent', json={'hostname': socket.gethostname()})
+            except httpx.RequestError:
+                pass
+            else:
+                if response.is_success:
+                    self.last_heartbeat = now
+                    self.id = response.json()['agent_id']
+                    break
             await asyncio.sleep(retry_interval)
 
         async with asyncio.TaskGroup() as tg:
@@ -341,10 +351,14 @@ class Agent:
                     files = None
 
                 now = time.time()
-                response = await client.post(f'/submit_result/{self.id}/{job_id}', data = data, files=files)
-                if response.is_success:
-                    self.last_heartbeat = now
-                    break
+                try:
+                    response = await client.post(f'/submit_result/{self.id}/{job_id}', data = data, files=files)
+                except httpx.RequestError:
+                    pass
+                else:
+                    if response.is_success:
+                        self.last_heartbeat = now
+                        break
 
                 await asyncio.sleep(retry_interval)
 
@@ -386,10 +400,14 @@ class Agent:
 
         while True:
             now = time.time()
-            response = await client.post(f'/submit_result/{self.id}/{job_id}', data = data)
-            if response.is_success:
-                self.last_heartbeat = now
-                return
+            try:
+                response = await client.post(f'/submit_result/{self.id}/{job_id}', data = data)
+            except httpx.RequestError:
+                pass
+            else:
+                if response.is_success:
+                    self.last_heartbeat = now
+                    return
 
             await asyncio.sleep(retry_interval)
 
@@ -432,26 +450,30 @@ class Agent:
                         return
 
                 now = time.time()
-                response = await client.post(f'/request_job/{self.id}')
-                if response.is_success:
-                    self.last_heartbeat = now
-                    job_json = response.json()
-                    if job_json is not None: # None indica nenhum trabalho disponível
-                        async with db_sessionmaker.begin() as session:    
-                            job = Job()
+                try:
+                    response = await client.post(f'/request_job/{self.id}')
+                except httpx.RequestError:
+                    pass
+                else:
+                    if response.is_success:
+                        self.last_heartbeat = now
+                        job_json = response.json()
+                        if job_json is not None: # None indica nenhum trabalho disponível
+                            async with db_sessionmaker.begin() as session:    
+                                job = Job()
 
-                            now = datetime.now()
+                                now = datetime.now()
 
-                            job.id = job_json['job_id']
-                            job.received_at = now
-                            job.assigned_at = now
-                            job.status = JobStatus.ASSIGNED
-                            job.assigned_worker_id = worker_id
-                            job.parameters = job_json['parameters']
-                            
-                            session.add(job)
-                            job_queue.put({'job_id': job_json['job_id'], 'parameters': job_json['parameters']})
-                            return
+                                job.id = job_json['job_id']
+                                job.received_at = now
+                                job.assigned_at = now
+                                job.status = JobStatus.ASSIGNED
+                                job.assigned_worker_id = worker_id
+                                job.parameters = job_json['parameters']
+                                
+                                session.add(job)
+                                job_queue.put({'job_id': job_json['job_id'], 'parameters': job_json['parameters']})
+                                return
                 
             await asyncio.sleep(retry_interval)
         else: # worker not alive
