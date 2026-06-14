@@ -85,16 +85,16 @@ n_workers = 4   # workers em paralelo por agent
 
 ## Requisitos
 
-- Python 3.14+
-- Dependências principais: FastAPI, Uvicorn, SQLAlchemy, httpx, aiofiles, aiosqlite, python-multipart
+- Python 3.12+
+- Dependências principais: FastAPI, Uvicorn, SQLAlchemy, httpx, aiofiles, aiosqlite, python-multipart, pyzstd
 
 ## Instalação
 
 ```bash
-python3.14 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 
-uv pip install fastapi uvicorn sqlalchemy aiosqlite httpx aiofiles python-multipart
+uv pip install fastapi uvicorn sqlalchemy aiosqlite httpx aiofiles python-multipart pyzstd
 ```
 
 ## Uso

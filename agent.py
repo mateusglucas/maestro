@@ -36,6 +36,8 @@ import json
 import tarfile
 from contextlib import nullcontext
 
+import pyzstd
+
 
 from sqlalchemy.sql.expression import true
 
@@ -351,8 +353,9 @@ class Agent:
 
     @staticmethod
     def create_archive(source_dir: Path, archive_path: Path) -> None:
-        with tarfile.open(archive_path, mode="w:zst") as tar:
-            tar.add(source_dir, arcname=".")
+        with pyzstd.open(archive_path, "wb") as zst:
+            with tarfile.open(fileobj=zst, mode="w|") as tar:
+                tar.add(source_dir, arcname=".")
 
     async def _send_error_result(self, worker_id, job_id, error, client: httpx.AsyncClient, db_sessionmaker):
         async with db_sessionmaker.begin() as session:
