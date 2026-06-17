@@ -1,10 +1,6 @@
-from pathlib import Path
-import sys
-
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-from agent import Agent
+from maestro.agent import Agent
 from time import sleep, time
+from pathlib import Path
 
 def delay(artifact_path: Path, delay):
     start = time()

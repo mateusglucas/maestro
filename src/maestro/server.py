@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 import aiofiles
 from pathlib import Path
 
-from common import JobResults, JobStatus
+from .common import JobResults, JobStatus
 
 ARTIFACTS_DIR = Path('artifacts')
 

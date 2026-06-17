@@ -1,9 +1,4 @@
-from pathlib import Path
-import sys
-
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-from server import Api, create_app
+from maestro.server import Api, create_app
 
 app = create_app(Api())
 

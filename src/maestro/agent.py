@@ -24,7 +24,7 @@ from contextlib import nullcontext
 
 import pyzstd
 
-from common import JobResults, JobStatus
+from .common import JobResults, JobStatus
 
 
 from sqlalchemy.sql.expression import true
