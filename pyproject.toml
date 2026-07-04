@@ -1,7 +1,7 @@
 [project]
 name = "maestro"
 version = "0.1.0"
-description = "Add your description here"
+description = "Distributed job orchestration with a FastAPI server and multiprocessing agents"
 readme = "README.md"
 authors = [
     { name = "mateusglucas", email = "mateusglucas@gmail.com" }

@@ -1,12 +1,12 @@
 # Maestro
 
-Maestro é um sistema de orquestração de jobs distribuídos. Um **server** central enfileira trabalhos, registra **agents** (máquinas que executam tarefas) e recebe resultados. Cada **agent** mantém um pool de **workers** em processos separados que processam jobs em paralelo.
+Maestro is a distributed job orchestration system. A central **server** queues jobs, registers **agents** (machines that execute work), and receives results. Each **agent** manages a pool of **workers** running in separate processes to process jobs in parallel.
 
-## Arquitetura
+## Architecture
 
 ```
                     ┌─────────────┐
-                    │   Cliente   │
+                    │   Client    │
                     │ (add_job)   │
                     └──────┬──────┘
                            │
@@ -23,43 +23,44 @@ Maestro é um sistema de orquestração de jobs distribuídos. Um **server** cen
        └─────────────┘ └──────────┘ └──────────┘
 ```
 
-**Fluxo básico:**
+**Basic flow:**
 
-1. Um cliente envia um job para o server (`POST /add_job`).
-2. O agent se registra no server e envia heartbeats periódicos.
-3. Workers ociosos pedem trabalho ao server (`POST /request_job/{agent_id}`).
-4. O worker executa a função de trabalho definida pelo usuário.
-5. O agent envia o resultado (e artefatos opcionais) de volta ao server (`POST /submit_result/...`).
+1. A client submits a job to the server (`POST /add_job`).
+2. The agent registers with the server and sends periodic heartbeats.
+3. Idle workers request work from the server (`POST /request_job/{agent_id}`).
+4. A worker runs the user-defined work function.
+5. The agent sends the result, and optional artifacts, back to the server (`POST /submit_result/...`).
 
-Se um worker morrer no meio de um job, o agent detecta a falha, devolve o job ao estado pendente e pode redistribuí-lo. Se um agent parar de enviar heartbeat, o server pode reatribuir jobs travados a outro agent.
+If a worker dies while running a job, the agent detects the failure, returns the job to the pending state, and can redistribute it. If an agent stops sending heartbeats, the server can reassign stuck jobs to another agent.
 
-## Componentes
+## Components
 
-| Arquivo | Papel |
-|---------|-------|
-| `server.py` | API FastAPI, modelos SQLAlchemy (`Job`, `Agent`), fila e persistência |
-| `agent.py` | Classe base `Agent`: heartbeat, pool de workers, fila local de jobs |
-| `common.py` | Tipos compartilhados entre server e agent (`JobStatus`, `JobResults`) |
-| `server_config.toml` | URL do banco e timeout de heartbeat do server |
-| `agent_config.toml` | URL do server, intervalo de heartbeat e número de workers |
-| `test_server.py` | Entry point ASGI do server |
-| `test_agent.py` | Exemplo mínimo de agent com função de trabalho vazia |
+| File | Role |
+|------|------|
+| `src/maestro/server.py` | FastAPI API, SQLAlchemy models (`Job`, `Agent`), queueing, and persistence |
+| `src/maestro/agent.py` | Base `Agent` class: heartbeat, worker pool, and local job queue |
+| `src/maestro/common.py` | Shared types between server and agent (`JobStatus`, `JobResults`) |
+| `examples/server_config.toml` | Database URL and server heartbeat timeout |
+| `examples/agent_config.toml` | Server URL, heartbeat interval, and number of workers |
+| `examples/basic_server.py` | Minimal ASGI server entry point |
+| `examples/basic_agent.py` | Minimal agent example |
+| `examples/basic_job_generator.py` | Utility for submitting example jobs |
 
-## API do server
+## Server API
 
-| Método | Rota | Descrição |
-|--------|------|-----------|
-| `POST` | `/register_agent` | Registra um agent (`{"hostname": "..."}`) e retorna `agent_id` |
-| `POST` | `/heartbeat/{agent_id}` | Atualiza `last_seen` do agent |
-| `POST` | `/request_job/{agent_id}` | Atribui o próximo job pendente (ou job de agent inativo) |
-| `POST` | `/submit_result/{agent_id}/{job_id}` | Envia resultado (`results` como JSON em form field) e artefato opcional |
-| `POST` | `/add_job` | Enfileira um job (`{"parameters": {...}}`) |
+| Method | Route | Description |
+|--------|-------|-------------|
+| `POST` | `/register_agent` | Registers an agent (`{"hostname": "..."}`) and returns `agent_id` |
+| `POST` | `/heartbeat/{agent_id}` | Updates the agent's `last_seen` timestamp |
+| `POST` | `/request_job/{agent_id}` | Assigns the next pending job, or a job from an inactive agent |
+| `POST` | `/submit_result/{agent_id}/{job_id}` | Submits a result (`results` as JSON in a form field) and an optional artifact |
+| `POST` | `/add_job` | Queues a job (`{"parameters": {...}}`) |
 
-### Status de job
+### Job Status
 
 `PENDING` → `ASSIGNED` → `COMPLETED` | `FAILED` | `CANCELLED`
 
-## Configuração
+## Configuration
 
 ### Server (`server_config.toml`)
 
@@ -68,7 +69,7 @@ Se um worker morrer no meio de um job, o agent detecta a falha, devolve o job ao
 url = "sqlite+aiosqlite:///test.db"
 
 [heartbeat]
-timeout = 300  # segundos sem heartbeat antes de considerar agent inativo
+timeout = 300  # seconds without heartbeat before an agent is considered inactive
 ```
 
 ### Agent (`agent_config.toml`)
@@ -78,46 +79,50 @@ timeout = 300  # segundos sem heartbeat antes de considerar agent inativo
 url = "http://localhost:8000"
 
 [heartbeat]
-interval = 150  # segundos entre heartbeats
+interval = 150  # seconds between heartbeats
 
 [jobs]
-n_workers = 4   # workers em paralelo por agent
+n_workers = 4   # parallel workers per agent
 ```
 
-## Requisitos
+## Requirements
 
 - Python 3.12+
-- Dependências principais: FastAPI, Uvicorn, SQLAlchemy, httpx, aiofiles, aiosqlite, python-multipart, pyzstd
+- Main dependencies: FastAPI, Uvicorn, SQLAlchemy, httpx, aiofiles, aiosqlite, python-multipart, pyzstd
 
-## Instalação
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-
-uv pip install fastapi uvicorn sqlalchemy aiosqlite httpx aiofiles python-multipart pyzstd
-```
-
-## Uso
-
-### 1. Subir o server
+## Installation
 
 ```bash
-uvicorn test_server:app --reload --host 0.0.0.0 --port 8000
+uv sync
 ```
 
-### 2. Implementar e rodar um agent
+## Usage
 
-Defina uma função de trabalho que recebe um diretório de artefatos e os parâmetros do job:
+The example configuration files live in `examples/`, so run the example commands from that directory:
+
+```bash
+cd examples
+```
+
+### 1. Start the server
+
+```bash
+uv run uvicorn basic_server:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 2. Implement and run an agent
+
+Define a work function that receives an artifact directory and the job parameters:
 
 ```python
-from agent import Agent
 from pathlib import Path
 
+from maestro.agent import Agent
+
 def work(artifact_path: Path, **parameters):
-    # Escreva saídas em artifact_path se necessário
+    # Write outputs to artifact_path if needed.
     output_file = artifact_path / "result.txt"
-    output_file.write_text(f"Processado: {parameters}")
+    output_file.write_text(f"Processed: {parameters}")
     return {"message": "ok"}
 
 agent = Agent(work)
@@ -125,42 +130,60 @@ agent.start()
 agent.join()
 ```
 
-### 3. Enviar um job
+Or run the included basic agent:
+
+```bash
+uv run python basic_agent.py
+```
+
+### 3. Submit a job
 
 ```bash
 curl -X POST http://localhost:8000/add_job \
   -H "Content-Type: application/json" \
-  -d '{"parameters": {"input": "exemplo"}}'
+  -d '{"parameters": {"input": "example"}}'
 ```
 
-Artefatos gerados pelo worker são compactados em tarball `.tar.zst` e enviados ao server, que os grava em `artifacts/`.
+Or submit multiple example jobs:
 
-## Modelo de execução do agent
+```bash
+uv run python basic_job_generator.py -n 10
+```
 
-- O agent roda em uma thread principal com três corrotinas: heartbeat, monitor de workers e loop de eventos.
-- Workers são processos filho (`multiprocessing.Process`) que consomem jobs de filas locais.
-- O agent mantém um SQLite efêmero em diretório temporário para rastrear jobs recebidos e workers ativos.
-- Redução soft do pool: quando `n_workers` diminui na config, workers ociosos recebem um job sentinela (`job_id: None`) e encerram gracefully.
+Artifacts generated by workers are compressed into `.tar.zst` tarballs and sent to the server, which stores them in `artifacts/`.
 
-## Estado do projeto
+## Agent Execution Model
 
-Maestro está em desenvolvimento ativo. Alguns pontos ainda em evolução:
+- The agent runs in a main thread with three coroutines: heartbeat, worker monitor, and event loop.
+- Workers are child processes (`multiprocessing.Process`) that consume jobs from local queues.
+- The agent keeps an ephemeral SQLite database in a temporary directory to track received jobs and active workers.
+- Soft pool reduction: when `n_workers` decreases in the config, idle workers receive a sentinel job (`job_id: None`) and shut down gracefully.
 
-- Controle dinâmico do número de workers (endpoint ou CLI)
-- Gerador de jobs de teste (`test_jobs_generator.py`)
-- Correções menores pendentes no agent (ex.: status de sucesso em `_send_completed_result`)
+## Project Status
 
-## Estrutura do repositório
+Maestro is under active development. Some areas are still evolving:
+
+- Dynamic worker count control through an endpoint or CLI
+- Test and example job generation
+- Minor agent fixes and runtime hardening
+
+## Repository Structure
 
 ```
 maestro/
-├── server.py              # Server e modelos de dados
-├── agent.py               # Agent e workers
-├── common.py              # Tipos compartilhados
-├── server_config.toml
-├── agent_config.toml
-├── test_server.py         # App ASGI
-├── test_agent.py          # Exemplo de agent
-├── test_jobs_generator.py # (WIP) utilitário para enfileirar jobs
-└── artifacts/             # Artefatos recebidos pelo server (criado em runtime)
+├── assets/
+│   └── readme-header.png
+├── examples/
+│   ├── README.md
+│   ├── basic_agent.py
+│   ├── basic_job_generator.py
+│   ├── basic_server.py
+│   ├── agent_config.toml
+│   └── server_config.toml
+├── src/
+│   └── maestro/
+│       ├── agent.py
+│       ├── common.py
+│       └── server.py
+└── artifacts/             # Runtime server artifacts
 ```
