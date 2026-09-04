@@ -1,5 +1,6 @@
-# TODO: implementar aumento/redução de workers dinâmico
-# TODO: atualizar README após inclusão de pasta samples
+# TODO: implement dynamic worker scaling
+# TODO: handle failure artifacts — if a job fails, consider writing a FAIL result file
+# so the server can receive a meaningful signal about the failure
 
 import tomllib
 from multiprocessing import Process, SimpleQueue
@@ -109,8 +110,8 @@ class Agent:
                     tg.create_task(self.event_loop(client, db_sessionmaker, runtime_dir))
 
     async def heartbeat(self, client: httpx.AsyncClient):
-        # Envia heartbeat pro server. Pula envio caso alguma outra mensagem já tenha sido enviada pro server,
-        # já que qualquer mensagem também serve como heartbeat para o server.
+        # Sends heartbeat to the server. Skips if another message was recently sent,
+        # since any message also serves as a heartbeat for the server.
         interval = self.config['heartbeat']['interval']
         retry_interval = 5
 
@@ -133,9 +134,9 @@ class Agent:
             await asyncio.sleep(time_to_sleep)
 
     async def workers_monitor(self, db_sessionmaker: async_sessionmaker[AsyncSession], runtime_dir: Path):
-        # Identifica workers mortos, redisponibiliza os jobs interrompidos e cria novos workers
+        # Detects dead workers, re-queues interrupted jobs, and spawns new workers
         poll_interval = 5
-        
+
         while True:
             cnt_alive_workers = 0
             async with db_sessionmaker.begin() as session:
@@ -145,15 +146,15 @@ class Agent:
                 )
 
                 alive_workers = (await session.execute(stmt)).scalars().all()
-                
+
                 for worker in alive_workers:
                     if self.workers[worker.id].is_alive():
                         cnt_alive_workers += 1
                     else:
                         worker.is_alive = False
-                        self.job_queues[worker.id] = None # deixar a queue ser fechada por ref count
-                                                          # para evitar erro caso alguma corrotina ainda
-                                                          # tente acessar a queue após o processo estar morto
+                        self.job_queues[worker.id] = None  # drop the queue by ref count to avoid
+                                                           # errors if a coroutine still tries to access
+                                                           # it after the process is dead
 
                         stmt = (
                             update(Job)
@@ -203,7 +204,7 @@ class Agent:
             await asyncio.sleep(poll_interval)
 
     @staticmethod
-    def _worker_main(worker_id, work_fn, jobs_queue: SimpleQueue, events_queue: SimpleQueue, runtime_dir: Path):
+    def _worker_main(worker_id: str, work_fn, jobs_queue: SimpleQueue, events_queue: SimpleQueue, runtime_dir: Path) -> None:
         while True:
             events_queue.put({
                 'type': Event.WORKER_IDLE,
@@ -258,31 +259,31 @@ class Agent:
 
         async with asyncio.TaskGroup() as tg:
             while True:
-                # verificar criação/destruição de workers
+                # check for worker creation/destruction
                 event = await asyncio.to_thread(self.events_queue.get)
 
                 if event['type'] == Event.WORKER_IDLE:
                     tg.create_task(self._request_new_job(event['worker_id'], client, db_sessionmaker))
 
                 elif event['type'] == Event.JOB_COMPLETED:
-                    tg.create_task(self._send_completed_result(event['worker_id'], 
-                                                                    event['job_id'], 
-                                                                    event['result'], 
-                                                                    client, 
-                                                                    db_sessionmaker, 
+                    tg.create_task(self._send_completed_result(event['worker_id'],
+                                                                    event['job_id'],
+                                                                    event['result'],
+                                                                    client,
+                                                                    db_sessionmaker,
                                                                     runtime_dir))
 
                 elif event['type'] == Event.JOB_FAILED:
-                    tg.create_task(self._send_error_result(event['worker_id'], 
-                                                                event['job_id'], 
-                                                                event['error'], 
-                                                                client, 
+                    tg.create_task(self._send_error_result(event['worker_id'],
+                                                                event['job_id'],
+                                                                event['error'],
+                                                                client,
                                                                 db_sessionmaker))
 
                 else:
                     raise RuntimeError(f'Unknown event {event['type']}.')
 
-    async def _send_completed_result(self, worker_id, job_id: str, result, client: httpx.AsyncClient, db_sessionmaker, runtime_dir: Path):
+    async def _send_completed_result(self, worker_id: str, job_id: str, result: dict[str, Any], client: httpx.AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession], runtime_dir: Path) -> None:
         async with db_sessionmaker.begin() as session:
             stmt = (
                 update(Job)
@@ -351,7 +352,7 @@ class Agent:
             with tarfile.open(fileobj=zst, mode="w|") as tar:
                 tar.add(source_dir, arcname=".")
 
-    async def _send_error_result(self, worker_id, job_id, error, client: httpx.AsyncClient, db_sessionmaker):
+    async def _send_error_result(self, worker_id: str, job_id: str, error: str, client: httpx.AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]) -> None:
         async with db_sessionmaker.begin() as session:
             stmt = (
                 update(Job)
@@ -437,7 +438,7 @@ class Agent:
                         self.last_heartbeat = now
                         job_json = response.json()
                         if job_json is not None: # None indica nenhum trabalho disponível
-                            async with db_sessionmaker.begin() as session:    
+                            async with db_sessionmaker.begin() as session:
                                 job = Job()
 
                                 now = datetime.now()
@@ -448,14 +449,12 @@ class Agent:
                                 job.status = JobStatus.ASSIGNED
                                 job.assigned_worker_id = worker_id
                                 job.parameters = job_json['parameters']
-                                
+
                                 session.add(job)
                                 job_queue.put({'job_id': job_json['job_id'], 'parameters': job_json['parameters']})
                                 return
-                
+
             await asyncio.sleep(retry_interval)
         else: # worker not alive
             if self.pending_terminations > 0:
                 self.pending_terminations -= 1
-
-# TODO: backtest: talvez adicionar file FAIL se o job falhar, porque eu preciso enviar results pro server e tem q sinalizar de alguma forma q deu falha.

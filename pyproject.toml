@@ -4,9 +4,10 @@ version = "0.1.0"
 description = "Distributed job orchestration with a FastAPI server and multiprocessing agents"
 readme = "README.md"
 authors = [
-    { name = "mateusglucas", email = "mateusglucas@gmail.com" }
+    { name = "mateusglucas" }
 ]
 requires-python = ">=3.12"
+license = { file = "LICENSE" }
 dependencies = [
     "aiofiles>=25.1.0",
     "aiosqlite>=0.22.1",

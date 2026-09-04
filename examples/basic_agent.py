@@ -4,7 +4,7 @@ from pathlib import Path
 
 def delay(artifact_path: Path, delay):
     start = time()
-    sleep(delay)    
+    sleep(delay)
     end = time()
 
     file = artifact_path / 'dummy'
